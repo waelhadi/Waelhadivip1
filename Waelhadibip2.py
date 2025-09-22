@@ -537,3 +537,14 @@ def afr(aweme_id,sessionid):
                          fa +=1
                          bi = random.choice([F,J,Z,C,B,L,J1,J2,J21,J22,F1,C1,P1])
                          print(bi+f"\r {len(soso)}/{len(tar)} True :{F}[{tr}] {bi}Net :{Z}[{fa}]{bi} {len(loop)}/{len(sisn)}",end=" ");sys.stdout.flush()
+          
+
+# -*- coding: utf-8 -*-
+# NASR — TikTok AR • Per-Session Report Selection • Lists fixed & cleaned
+
+# -*- coding: utf-8 -*-
+# NASR — TikTok AR • Per-Session, No-Miss ID Processing with Retries
+
+import os, re, time, sys, threading, gc, random
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue, Empty
