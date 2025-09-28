@@ -1,550 +1,929 @@
-import threading
-import time
 import os
+import re
+import sys
+import time
+import json
 import random
+import threading
+import hashlib
+import datetime
+import binascii
+import secrets
+import queue
+from collections import deque
+from urllib.parse import urlencode
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-ls = []
-file = 'nasr1.txt'
+import requests
+import names
+import pyfiglet
+from termcolor import colored
+from colorama import init, Fore, Style
 
-def read_file():
-    """قراءة البروكسيات من الملف مع تنظيف الأسطر الفارغة والتعليقات وإزالة التكرار."""
+import os, re, json, time, random, threading, queue
+from collections import deque
+
+OUTPUT_FILE          = "3.txt"
+IMMEDIATE_SAVE_FLUSH = True
+REQUEST_TIMEOUT      = 10
+RETRY_TOTAL          = 2
+UI_REFRESH_SEC       = 0.25
+USE_PROXIES          = True
+
+TIKWM_INFO_URL  = "https://www.tikwm.com/api/user/info"
+TIKWM_POSTS_URL = "https://www.tikwm.com/api/user/posts"
+
+BR = "\033[1m"
+R  = "\033[91m"+BR
+G  = "\033[92m"+BR
+Y  = "\033[93m"+BR
+B  = "\033[94m"+BR
+M  = "\033[95m"+BR
+C  = "\033[96m"+BR
+W  = "\033[97m"+BR
+RS = "\033[0m"
+
+def bar(val, vmax, width=30):
+    vmax = max(1, int(vmax)); val = max(0, min(int(val), vmax))
+    fill = int(width * (val/float(vmax)))
+    return "█"*fill + "░"*(width-fill)
+
+try:
+    import pyfiglet
+except ImportError:
+    os.system("pip install pyfiglet >/dev/null 2>&1")
+    import pyfiglet
+
+def tiktok_logo_big():
+    ascii_banner = pyfiglet.figlet_format("TIKTOK", font="slant")
+    lines = ascii_banner.splitlines()
+    colors = [C, M, W] 
+    colored = []
+    for i, line in enumerate(lines):
+        col = colors[i % len(colors)]
+        colored.append(f"{col}{line}{RS}")
+    return "\n".join(colored)
+
+def load_proxies(path="nasr1.txt"):
+    arr=[]
     try:
-        if not os.path.isfile(file):
-            return []
-        lines = []
-        seen = set()
-        with open(file, 'r', encoding='utf-8', errors='ignore') as f:
-            for raw in f.read().splitlines():
-                line = raw.strip()
-                if not line or line.startswith(("#", ";", "//")):
-                    continue
-                if line in seen:
-                    continue
-                seen.add(line)
-                lines.append(line)
-        return lines
+        with open(path,"r",encoding="utf-8") as f:
+            for ln in f:
+                p=ln.strip()
+                if p and not p.startswith("#"): arr.append(p)
     except FileNotFoundError:
-        return []
+        pass
+    return arr
+PROXIES = load_proxies("nasr1.txt")
+def pick_proxy():
+    if not (USE_PROXIES and PROXIES): return None
+    return random.choice(PROXIES)
 
-def _normalize_proxy(line: str, default_scheme: str = "http") -> str:
-    """
-    يدعم صيغ:
-      - http://host:port
-      - https://user:pass@host:port
-      - socks5://host:port
-      - host:port
-      - user:pass@host:port
-      - host:port:user:pass  (بعض القوائم تكتبها هكذا)
-      - user:pass:host:port
-    """
-    s = line.strip()
+_write_q = queue.Queue(maxsize=200000)
+_stop_writer = threading.Event()
+_seen = set()
 
-    if s.startswith(("http://", "https://", "socks5://", "socks4://")):
-        return s
+def writer_thread(path):
+    f = open(path,"a",encoding="utf-8",buffering=1)
+    try:
+        while not _stop_writer.is_set():
+            try: vid = _write_q.get(timeout=0.25)
+            except queue.Empty: continue
+            f.write(vid+"\n")
+            if IMMEDIATE_SAVE_FLUSH: f.flush()
+    finally:
+        try: f.flush()
+        except: pass
+        f.close()
 
-    s = s.replace(" ", "")
+def save_id(vid: str):
+    if not (vid and vid.isdigit()): return False
+    if vid in _seen: return False
+    _seen.add(vid)
+    try:
+        _write_q.put_nowait(vid)
+        return True
+    except queue.Full:
+        return False
 
-    if "@" in s and s.count(":") >= 2:
-        return f"{default_scheme}://{s}"
+def load_existing_ids():
+    try:
+        with open(OUTPUT_FILE,"r",encoding="utf-8") as f:
+            for ln in f:
+                s = ln.strip()
+                if s.isdigit(): _seen.add(s)
+    except FileNotFoundError:
+        pass
 
-    parts = s.split(":")
-    if len(parts) == 2 and parts[1].isdigit():
-        host, port = parts
-        return f"{default_scheme}://{host}:{port}"
+try:
+    import requests
+except ImportError:
+    os.system("pip install requests >/dev/null 2>&1")
+    import requests
 
-    if len(parts) == 4 and parts[3].isdigit():
-        user, pwd, host, port = parts
-        return f"{default_scheme}://{user}:{pwd}@{host}:{port}"
+def jget(url, headers=None, params=None, timeout=REQUEST_TIMEOUT, proxy=None):
+    for attempt in range(1, RETRY_TOTAL+2):
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=timeout,
+                             proxies={"http":proxy,"https":proxy} if proxy else None)
+            if r.ok:
+                try: return r.json()
+                except: return {}
+        except Exception:
+            if attempt==RETRY_TOTAL+1: return {}
+            time.sleep(0.25*attempt + random.uniform(0,0.2))
+    return {}
 
-    if len(parts) == 4 and parts[1].isdigit():
-        host, port, user, pwd = parts
-        return f"{default_scheme}://{user}:{pwd}@{host}:{port}"
+def tget(url, headers=None, params=None, timeout=REQUEST_TIMEOUT, proxy=None):
+    for attempt in range(1, RETRY_TOTAL+2):
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=timeout,
+                             proxies={"http":proxy,"https":proxy} if proxy else None)
+            if r.ok: return r.text
+        except Exception:
+            if attempt==RETRY_TOTAL+1: return ""
+            time.sleep(0.25*attempt + random.uniform(0,0.2))
+    return ""
 
-    return f"{default_scheme}://{s}"
+def parse_ids_from_text(text, push):
+    if not text: return 0
+    got = 0
+    for m in re.finditer(r'/video/(\d+)', text):
+        if push(m.group(1)): got += 1
+    for m in re.finditer(r'"aweme_id"\s*:\s*"(\d+)"', text):
+        if push(m.group(1)): got += 1
+    return got
 
-def _to_requests_proxies(proxy_url: str) -> dict:
-    """تهيئة dict مناسب لـ requests سواء http أو https أو socks."""
-    return {"http": proxy_url, "https": proxy_url}
+def mirror_pull_user(username, push):
+    proxy = pick_proxy()
+    total = 0
+    for base in ("www.tiktok.com","m.tiktok.com"):
+        url = f"https://r.jina.ai/http://{base}/@{username}"
+        text = tget(url, headers={"User-Agent":"curl/8.5"}, proxy=proxy)
+        total += parse_ids_from_text(text, push)
+    return total
 
-def _build_headers_minimal() -> dict:
-    """
-    هِدرز خفيفة بدون User-Agent حسب طلبك.
-    تُبقي على accept-encoding واللغة والاتصال فقط.
-    """
-    return {
-        "Accept-Encoding": "gzip, deflate",
-        "Connection": "Keep-Alive",
-        "Accept-Language": "en-US,en;q=0.8,ar;q=0.7",
-    }
+def tikwm_user_info(username):
+    proxy = pick_proxy()
+    j = jget(TIKWM_INFO_URL, params={"unique_id":username}, proxy=proxy)
+    if j.get("code")==0:
+        data = j.get("data") or {}
+        return data.get("sec_uid"), data
+    return None, {}
 
-def process_line(line: str):
-    """
-    تُرجع (proxies, headers) للاستخدام لاحقًا بدون أي طباعة.
-    """
-    proxy_url = _normalize_proxy(line, default_scheme="http")
-    proxies = _to_requests_proxies(proxy_url)
-    headers = _build_headers_minimal()  
-    return proxies, headers
+def tikwm_posts_by_unique(username, cursor=0, count=200):
+    proxy = pick_proxy()
+    return jget(TIKWM_POSTS_URL, params={"unique_id":username, "count":str(count), "cursor":str(cursor)}, proxy=proxy)
 
-def process_lines(lines):
-    results = []
-    if not lines:
-        return results
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = [executor.submit(process_line, line) for line in lines]
-        for future in as_completed(futures):
-            results.append(future.result())
-    return results
+def tikwm_posts_by_secuid(sec_uid, cursor=0, count=200):
+    proxy = pick_proxy()
+    return jget(TIKWM_POSTS_URL, params={"sec_uid":sec_uid, "count":str(count), "cursor":str(cursor)}, proxy=proxy)
 
-def update_file_loop():
-    """
-    حلقة تحديث مستمرة: تقرأ الملف كل 120 ثانية وتُجهّز النتائج للاستخدام لاحقًا.
-    لا يوجد أي طباعة.
-    """
-    global ls
+STATS_LOCK = threading.Lock()
+RATE_HIST  = deque(maxlen=600)
+START_TS   = time.time()
+GLOBAL = {
+    "total_found": 0,
+    "saved_new":   0,
+    "users_total": 0,
+    "users_done":  0,
+    "per_user":    {}
+}
+STOP_UI = threading.Event()
+
+def stats_init_user(username):
+    with STATS_LOCK:
+        GLOBAL["per_user"][username] = {"state":"init","pages":0,"last_got":0,"total":0,"cursor":0,"src":"-"}
+
+def stats_update_user(username, **kw):
+    with STATS_LOCK:
+        u = GLOBAL["per_user"].get(username, {})
+        u.update(kw)
+        GLOBAL["per_user"][username] = u
+
+def stats_add_ids(username, ids_count, cursor, src):
+    with STATS_LOCK:
+        u = GLOBAL["per_user"].get(username, {})
+        u["last_got"] = ids_count
+        u["total"]    = u.get("total",0) + ids_count
+        u["cursor"]   = cursor
+        u["src"]      = src
+        GLOBAL["per_user"][username] = u
+        GLOBAL["total_found"] += ids_count
+        GLOBAL["saved_new"]   = len(_seen)
+        RATE_HIST.append((time.time(), GLOBAL["total_found"]))
+
+def stats_mark_done(username):
+    with STATS_LOCK:
+        GLOBAL["users_done"] += 1
+        u = GLOBAL["per_user"].get(username, {})
+        u["state"]="done"; GLOBAL["per_user"][username]=u
+
+def rate_now_and_avg10s():
+    with STATS_LOCK:
+        t  = time.time(); tot= GLOBAL["total_found"]; RATE_HIST.append((t, tot))
+        if len(RATE_HIST)>=2:
+            (t1,v1)=RATE_HIST[-1]; (t0,v0)=RATE_HIST[-2]
+            dt=max(1e-6,t1-t0); r_now=(v1-v0)/dt
+        else: r_now=0.0
+        t_cut=t-10; v_old=None; t_old=None
+        for (tx,vx) in reversed(RATE_HIST):
+            if tx<=t_cut: v_old=vx; t_old=tx; break
+        if v_old is None and RATE_HIST:
+            t_old, v_old = RATE_HIST[0]
+        dt10=max(1e-6,t-t_old) if t_old else 1.0
+        r_avg=(tot-(v_old or 0))/dt10
+        return r_now, r_avg
+
+def banner():
+    line = "─"*64
+    return f"{C}{line}{RS}\n{tiktok_logo_big()}\n{C}{line}{RS}"
+
+def ui_draw():
+    try: print("\x1b[H\x1b[2J", end="")
+    except: pass
+    print(banner())
+    elapsed = time.time() - START_TS
+    h=int(elapsed//3600); m=int((elapsed%3600)//60); s=int(elapsed%60)
+    r_now, r_avg = rate_now_and_avg10s()
+    with STATS_LOCK:
+        tf = GLOBAL["total_found"]; sv = GLOBAL["saved_new"]
+        ud = GLOBAL["users_done"];  ut = GLOBAL["users_total"]
+        per = dict(GLOBAL["per_user"])
+    print(f"{M}⏱ Time:{RS} {Y}{h:02d}:{m:02d}:{s:02d}{RS}  {C}Now:{RS} {W}{r_now:5.1f}{RS} id/s  {C}Avg(10s):{RS} {W}{r_avg:5.1f}{RS} id/s")
+    print(f"{G}Total IDs:{RS} {W}{tf}{RS}   {G}Saved:{RS} {W}{sv}{RS}   {B}Users:{RS} {W}{ud}/{ut}{RS}")
+    print(f"{Y}Progress {RS}|{bar(sv, max(tf,1), 42)}| {sv}/{tf}")
+    print(f"{C}{'─'*94}{RS}")
+    print(f"{W}{'Username':<20}{'State':<10}{'Pages':<8}{'Last':<8}{'Total':<8}{'Cursor':<10}{'Source':<12}{RS}")
+    print(f"{C}{'─'*94}{RS}")
+    rows = sorted(per.items(), key=lambda kv: kv[1].get("total",0), reverse=True)
+    for uname, st in rows:
+        state = st.get("state","-"); pages=st.get("pages",0); last=st.get("last_got",0)
+        totu  = st.get("total",0);   cur  = st.get("cursor",0); src = st.get("src","-")
+        col = G if state=="done" else (Y if state in ("run","tikwm","jina") else M)
+        print(f"{W}{uname:<20}{col}{state:<10}{RS}{W}{pages:<8}{last:<8}{totu:<8}{cur:<10}{src:<12}{RS}")
+    print()
+
+def ui_loop():
+    while not STOP_UI.is_set():
+        ui_draw()
+        time.sleep(UI_REFRESH_SEC)
+
+def pull_with_tikwm(username):
+    stats_update_user(username, state="tikwm", pages=0, last_got=0, total=0, cursor=0, src="tikwm-uid")
+    total = 0
+    cursor = 0
     while True:
-        new_lines = read_file()
-        ls = new_lines
-        _ = process_lines(new_lines)
-        time.sleep(120)
+        j = tikwm_posts_by_unique(username, cursor=cursor, count=200)
+        if j.get("code") != 0: break
+        data = j.get("data") or {}
+        vids = data.get("videos") or []
+        got = 0
+        for v in vids:
+            aw = v.get("video_id") or v.get("aweme_id") or v.get("id")
+            if aw and str(aw).isdigit():
+                if save_id(str(aw)): got += 1
+        total += got
+        has_more = int(data.get("hasMore") or data.get("has_more") or 0)
+        cursor   = int(data.get("cursor") or 0)
+        with STATS_LOCK:
+            pu = GLOBAL["per_user"][username]; pu["pages"] += 1
+        stats_add_ids(username, got, cursor, "tikwm-uid")
+        if not has_more or got==0: break
+    sec_uid, _ = tikwm_user_info(username)
+    if sec_uid:
+        cursor=0
+        while True:
+            j = tikwm_posts_by_secuid(sec_uid, cursor=cursor, count=200)
+            if j.get("code") != 0: break
+            data = j.get("data") or {}
+            vids = data.get("videos") or []
+            got = 0
+            for v in vids:
+                aw = v.get("video_id") or v.get("aweme_id") or v.get("id")
+                if aw and str(aw).isdigit():
+                    if save_id(str(aw)): got += 1
+            total += got
+            has_more = int(data.get("hasMore") or data.get("has_more") or 0)
+            cursor   = int(data.get("cursor") or 0)
+            with STATS_LOCK:
+                pu = GLOBAL["per_user"][username]; pu["pages"] += 1
+            stats_add_ids(username, got, cursor, "tikwm-sec")
+            if not has_more or got==0: break
+    return total
 
-ls = read_file()
-_ = process_lines(ls)
+def pull_with_mirror(username):
+    stats_update_user(username, state="jina", src="jina")
+    got = mirror_pull_user(username, lambda vid: save_id(vid))
+    stats_add_ids(username, got, 0, "jina")
+    return got
 
-thread = threading.Thread(target=update_file_loop, daemon=True)
-thread.start()
-def afr(aweme_id,sessionid):
-                    global tr,fa,er
-                    proxies1=str(random.choice(ls))
-                    _rticket = int(time.time() * 1000)
-                    ts=str(int(time.time() * 1000))[:10]
-                    from uuid import uuid4
-                    uid=str(uuid4())
-                    install_id = random.randrange(7334285683765348101, 7334285999999999999)
-                    device_id=random.randrange(7283928371561793029, 7283929999999999999)
-                    openudid = str(binascii.hexlify(os.urandom(8)).decode())
-                    tz_name = random.choice(['America/New_York', 'Europe/London', 'Asia/Tokyo', 'Australia/Sydney', 'Asia/Kolkata', 'America/Los_Angeles', 'Europe/Paris', 'Asia/Dubai', 'America/Sao_Paulo', 'Asia/Shanghai'])
-                    webcast_language = random.choice(['en', 'es', 'fr', 'de', 'ja', 'pt', 'it', 'ru', 'ar', 'hi'])
-                    current_region = random.choice(['US', 'UK', 'CA', 'AU', 'IN', 'BR', 'FR', 'DE', 'IT', 'ES','AB'])
-                    region = random.choice(['US', 'UK', 'CA', 'AU', 'IN', 'BR', 'FR', 'DE', 'IT', 'ES'])
-                    screen_height = random.randint(600,1080)
-                    screen_width = random.randint(800,1920)
-                    samsung = ["SM-G975F","SM-G532G","SM-N975F","SM-G988U","SM-G977U","SM-A705FN","SM-A515U1","SM-G955F","SM-A750G","SM-N960F","SM-G960U","SM-J600F","SM-A908B","SM-A705GM","SM-G970U","SM-A307FN","SM-G965U1","SM-A217F","SM-G986B","SM-A207M","SM-A515W","SM-A505G","SM-A315G","SM-A507FN","SM-A505U1","SM-G977T","SM-A025G","SM-J320F","SM-A715W","SM-A908N","SM-A205F","SM-G988B","SM-N986B","SM-A715F","SM-A515F","SM-G965F","SM-G960F","SM-A505F","SM-A207F","SM-A307G","SM-G970F","SM-A107F","SM-G935F","SM-G935A","SM-A310F","SM-J320FN"]
-                    oppo =['CPH2359','CPH2457','CPH2349','CPH2145','CPH2293','CPH2343','CPH2127','CPH2197','CPH2173','CPH2371','CPH2269','CPH2005','CPH2185']
-                    realme=['RMX3501','RMX3085','RMX1921','RMX3771','RMX3461','RMX3092','RMX3393','RMX3392','RMX1821','RMX1825','RMX3310',]
-                    phone=random.choice([samsung,oppo,realme])
-                    type1=random.choice(phone)
-                    if 'SM' in type1 :
-                         brand='samsung'
-                         dev=type1.split('-')[1]
-                    if 'RMX' in type1:
-                         brand='realme'
-                         dev=type1.split('X')[1]
-                    if 'CPH' in type1:
-                         brand='OPPO'
-                         dev=type1.split('H')[1]
+def process_user(username):
+    stats_init_user(username)
+    total = pull_with_tikwm(username)
+    if total == 0:
+        total += pull_with_mirror(username)
+    stats_mark_done(username)
+    return total
 
-                    off=int(round((datetime.datetime.now() - datetime.datetime.utcnow()).total_seconds()))
-                    if aobsh == '1':
-                         time1 = int(datetime.datetime.now().timestamp())
-                         
-                         reason=str(random.choice(sdsd))
-                         pro1=urlencode({'WebIdLastTime': time1,
-'aid': '1988', 
-'app_language': 'de', 
-'app_name': 'tiktok_web', 
-'aweme_type':' 0', 
-'browser_language':' de', 
-'browser_name': 'Mozilla', 
-'browser_online': 'true', 
-'browser_platform': 'Win32', 
-'channel':' tiktok_web', 
-'cookie_enabled': 'true', 
-'current_region': 'DE', 
-'data_collection_enabled': 'true', 
-'device_id': 'did', 
-'device_platform': 'web_pc',
-'focus_state': 'true',
-'from_page': 'fyp',
-'history_len': '2',
-'is_fullscreen': 'false',
-'is_page_visible': 'true',
-'is_sub_only_video': '0',
-'lang': 'ar',
-'legal_jurisdiction': 'de',
-'logout_reporter_email': '',
-'nickname':  nickname,
-'object_id': aweme_id,
-'object_owner_id':id, 
-'odinId': 'odinId', 
-'os': 'windows',
-'owner_id':  id, 
-'screen_width': screen_width,
-'lang': webcast_language,
-'owner_id':id,
-'object_id':aweme_id,
-'iid':install_id,
-'device_id':device_id,
-'device_type':type1,
-'device_brand':brand,
-'language':webcast_language,
-'openudid':openudid,
-'_rticket':_rticket,
-'current_region':current_region,
-"object_id": aweme_id,
-"device_id": device_id,
-"object_owner_id": id,
-"owner_id": id,
-"reason": reason,
-"target": aweme_id,
-"owner_id":id,
-'screen_height': screen_height,
-'screen_width': screen_width,
-'_rticket':_rticket,
-'play_mode': 'one_column', 
-   "US": "America/New_York",
-    "CA": "America/Toronto",
-    "GB": "Europe/London",
-    "DE": "Europe/Berlin",
-    "FR": "Europe/Paris",
-    "IT": "Europe/Rome",
-    "ES": "Europe/Madrid",
-    "RU": "Europe/Moscow",
-    "CN": "Asia/Shanghai",
-    "JP": "Asia/Tokyo",
-    "KR": "Asia/Seoul",
-    "IN": "Asia/Kolkata",
-    "BR": "America/Sao_Paulo",
-    "MX": "America/Mexico_City",
-    "AE": "Asia/Dubai",
-    "SA": "Asia/Riyadh",
-    "EG": "Africa/Cairo",
-    "TR": "Europe/Istanbul",
-    "AU": "Australia/Sydney",
-    "NL": "Europe/Amsterdam",
-    "SE": "Europe/Stockholm",
-    "CH": "Europe/Zurich",
-    "PL": "Europe/Warsaw",
-    "NG": "Africa/Lagos",
-    "ZA": "Africa/Johannesburg",
-    "ID": "Asia/Jakarta",
-    "TH": "Asia/Bangkok",
-    "MY": "Asia/Kuala_Lumpur",
-    "SG": "Asia/Singapore",
-    "PH": "Asia/Manila",
-    "PK": "Asia/Karachi",
-    "AR": "America/Argentina/Buenos_Aires",
-    "CO": "America/Bogota",
-    "VE": "America/Caracas",
-    "IR": "Asia/Tehran",
-    "IQ": "Asia/Baghdad",
-    "UA": "Europe/Kyiv",
-    "BE": "Europe/Brussels",
-    "AT": "Europe/Vienna",
-    "DK": "Europe/Copenhagen",
-    "NO": "Europe/Oslo",
-    "FI": "Europe/Helsinki",
-    "CZ": "Europe/Prague",
-    "PT": "Europe/Lisbon",
-    "HU": "Europe/Budapest",
-    "GR": "Europe/Athens",
-    "IL": "Asia/Jerusalem",
-    "NZ": "Pacific/Auckland",
-    "CA": "North America",
-    "MX": "North America",
-    "BR": "South America",
-    "AR": "South America",
-    "CO": "South America",
-    "VE": "South America",
-    "GB": "Europe",
-    "DE": "Europe",
-    "FR": "Europe",
-    "IT": "Europe",
-    "ES": "Europe",
-    "RU": "Europe",
-    "UA": "Europe",
-    "BE": "Europe",
-    "AT": "Europe",
-    "NL": "Europe",
-    "SE": "Europe",
-    "CH": "Europe",
-    "PL": "Europe",
-    "CZ": "Europe",
-    "DK": "Europe",
-    "NO": "Europe",
-    "FI": "Europe",
-    "PT": "Europe",
-    "HU": "Europe",
-    "GR": "Europe",
-    "CN": "Asia",
-    "JP": "Asia",
-    "KR": "Asia",
-    "IN": "Asia",
-    "AE": "Asia",
-    "SA": "Asia",
-    "IR": "Asia",
-    "IQ": "Asia",
-    "IL": "Asia",
-    "ID": "Asia",
-    "TH": "Asia",
-    "MY": "Asia",
-    "SG": "Asia",
-    "PH": "Asia",
-    "PK": "Asia",
-    "EG": "Africa",
-    "NG": "Africa",
-    "ZA": "Africa",
-    "NZ": "Oceania",
-    "AU": "Oceania",
-'reason': reason,
-'referer':' ',
-'region': 'de', 
-'relevant_law': '', 
-'report_desc':' ', 
-'report_signature': '', 
-'report_type': 'video',
-'reporter_id': 'didd',
-'screen_height': '1080', 
-'screen_width': '1920', 
-'submit_type': '1', 
-'target': aweme_id,
-'trusted_flagger_email': '', 
-'tz_name':' Europe/Berlin', 
-'user_is_login': 'true', 
-'video_id': aweme_id, 
-'video_owner': '[object Object]', 
-'webcast_language': 'ar', 
-'msToken': 'JcZGLqbVFNbTZCdJdKn5u3F-KQCo1RCDKZpx88q01_SKvnIqnunxRRdx1cT-_T0f1YamamErEI4xrmULvPFQ7ZIbHfwtNsy8EQGdhUQs25raLxLNny8_gnVvIpQudM861YvW9mt0Qv1LdQ==',
-'X-Bogus': 'DFSzswVLFr0ANVSxCchLEKvVLFS5', 
-'X-Gnarly':' M/G6B3TKwfeciheF/-jRLswpvDhkihTdWCiuhFAOmTWVVxOYJ13or1V8QDX/81vSJ/U-nnhvoA9yUhUxxenFNoJbkisqM7WrA/viUCABfuGuUZJ3KmmXHSYpcCOGldRUsYbhILNc83pK57Hcw03awplIDuXcUeppmNwbCKY1/AKlFyAStoqTzwY6Q7ujz5LlEtgt5UvsdRWfnMmkLv8n8fw5t1Q/pkZWLLQnYhzM9F-lndqfk1a-pLXJfRFR7DRTTDJvw2L3l94A',   
-'aid': '1988', 
-'app_language': 'ar', 
-'app_name': 'tiktok_web', 
-'aweme_type':' 0', 
-'browser_language':' ar-EG', 
-'browser_name': 'Mozilla', 
-'browser_online': 'true', 
-'browser_platform': 'Win32', 
-'channel':' tiktok_web', 
-'cookie_enabled': 'true', 
-'current_region': 'DE', 
-'data_collection_enabled': 'true', 
-'device_id': 'did', 
-'device_platform': 'web_pc',
-'focus_state': 'true',
-'from_page': 'fyp',
-'history_len': '2',
-'is_fullscreen': 'false',
-'is_page_visible': 'true',
-'is_sub_only_video': '0',
-'lang': 'ar',
-'legal_jurisdiction': 'no',
-'logout_reporter_email': '',
-'nickname':  nickname,
-'object_id': aweme_id,
-'object_owner_id':id, 
-'odinId': 'odinId', 
-'os': 'windows',
-'owner_id':  id, 
-'play_mode': 'one_column', 
-'priority_region': 'DE',
-'reason': reason,
-'referer':' ',
-'region': 'DE', 
-'relevant_law': '', 
-'report_desc':' ', 
-'report_signature': '', 
-'report_type': 'video',
-'reporter_id': 'didd',
-'screen_height': '1080', 
-'screen_width': '1920', 
-'submit_type': '1', 
-'target': aweme_id,
-'trusted_flagger_email': '', 
-'tz_name':' Europe/Berlin', 
-'user_is_login': 'true', 
-'video_id': aweme_id, 
-'video_owner': '[object Object]', 
-'webcast_language': 'ar', 
-'msToken': 'JcZGLqbVFNbTZCdJdKn5u3F-KQCo1RCDKZpx88q01_SKvnIqnunxRRdx1cT-_T0f1YamamErEI4xrmULvPFQ7ZIbHfwtNsy8EQGdhUQs25raLxLNny8_gnVvIpQudM861YvW9mt0Qv1LdQ==',
-'X-Bogus': 'DFSzswVLFr0ANVSxCchLEKvVLFS5', 
-'X-Gnarly':' M/G6B3TKwfeciheF/-jRLswpvDhkihTdWCiuhFAOmTWVVxOYJ13or1V8QDX/81vSJ/U-nnhvoA9yUhUxxenFNoJbkisqM7WrA/viUCABfuGuUZJ3KmmXHSYpcCOGldRUsYbhILNc83pK57Hcw03awplIDuXcUeppmNwbCKY1/AKlFyAStoqTzwY6Q7ujz5LlEtgt5UvsdRWfnMmkLv8n8fw5t1Q/pkZWLLQnYhzM9F-lndqfk1a-pLXJfRFR7DRTTDJvw2L3l94A',
- 
+def main():
+    if os.path.exists(OUTPUT_FILE):
+        ch = input(f"{Y}Clear {OUTPUT_FILE} before starting? (y/N): {RS}").strip().lower()
+        if ch in ("y","yes"):
+            open(OUTPUT_FILE,"w",encoding="utf-8").close()
+            print(f"{G}[✓]{RS} File cleared.")
+    load_existing_ids()
+    try:
+        n = int(input(f"{W}Enter number of usernames: {RS}").strip())
+    except:
+        print(f"{R}Invalid number.{RS}"); return
+    users = []
+    for i in range(n):
+        u = input(f"{C}Username #{i+1} (without @): {RS}").strip().lstrip("@")
+        if u: users.append(u)
+    if not users:
+        print(f"{R}No usernames provided.{RS}"); return
+    with STATS_LOCK:
+        GLOBAL["users_total"] = len(users)
+    wt  = threading.Thread(target=writer_thread, args=(OUTPUT_FILE,), daemon=True); wt.start()
+    uit = threading.Thread(target=ui_loop, daemon=True); uit.start()
+    grand = 0
+    for u in users:
+        print(f"{W}[>] @{u}{RS} — starting …")
+        got = process_user(u)
+        print(f"{C}[=] @{u}{RS} — collected {G}{got}{RS} IDs")
+        grand += got
+    time.sleep(0.3); STOP_UI.set(); time.sleep(0.2); _stop_writer.set(); time.sleep(0.2)
+    print("\n" + "═"*60)
+    print(f"{G}Done — new total collected: {grand}{RS}")
 
-                              '_signature': '_02B4Z6wo00001qvYUFwAAIDArHJl-y89yw6r2FTAAMyOac',})
-                         url='https://www.tiktok.com/aweme/v2/aweme/feedback/?%s'%(pro1)
+if __name__ == "__main__":
+    main()
+import requests,random,datetime,binascii,os,threading,names,secrets,sys
+import hashlib
+import json
+import time
+from urllib.parse   import urlencode
+import requests,sys,os,time
+import requests
+import sys
+import time
+import pyfiglet
+from termcolor import colored
+from colorama import init, Fore, Style
+import requests
+from colorama import init, Fore
+import re
+session = requests.Session()
+soso = []
+loop = []
+tar = []
+x_ = []
+ls = []
+sisn = []  
 
-                         url='https://www.tiktok.com/aweme/v2/aweme/feedback/?%s'%(pro1)
 
-                         h={
 
-                              'Cookie': f'ttwid={ttwid}; sid_tt='+sessionid+'; sessionid='+sessionid+'; sessionid_ss='+sessionid+';',
 
-                               'Referer': 'https://www.tiktok.com/@'+g+'/video/'+aweme_id,
+import os, sys, time, requests
+from colorama import init, Fore, Style
+init(autoreset=True)
 
-                              'Sec-Fetch-Site': 'same-origin',
+ACCENT1 = Fore.CYAN + Style.BRIGHT   # سماوي
+ACCENT2 = Fore.RED  + Style.BRIGHT   # قرمزي
+TEXT    = Fore.WHITE + Style.NORMAL
+TITLE   = Fore.WHITE + Style.BRIGHT
 
-                              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',}
-                         
-                    if aobsh == '2':
-                         if xxx == '14': 
-                              pro=urlencode({
-                              'logout_reporter_email':'',
-                              'reason':'9013',
-                              'enter_from':'homepage_hot',
-                              'owner_id':id,
-                              'report_type':'video',
-                              'object_id':aweme_id,
-                              'no_hw':'1',
-                              'submit_type':'1',
-                              'isFirst':'1',
-                              'trusted_flagger_email':'',
-                              'report_signature':f'{names.get_last_name()} {names.get_last_name()} {names.get_last_name()}',
-                              'extra_log_params':'%7B%22last_from_group_id%22%3A%22'+aweme_id+'%22%2C%22is_ecom%22%3A%220%22%7D',
-                              'category':'',
-                              'legal_jurisdiction':'dk',
-                              'iid':install_id,
-                              'device_id':device_id,
-                              'ac':'wifi',
-                              'channel':'googleplay',
-                              'aid':'1233',
-                              'app_name':'musical_ly',
-                              'version_code':'330304',
-                              'version_name':'33.3.4',
-                              'device_platform':'android',
-                              'os':'android',
-                              'ab_version':'33.3.4',
-                              'ssmix':'a',
-                              'device_type':type1,
-                              'device_brand':brand,
-                              'language':webcast_language,
-                              'os_api':'28',
-                              'os_version':'9',
-                              'openudid':openudid,
-                              'manifest_version_code':'2023303040',
-                              'resolution':f'{screen_width}*{screen_height}',
-                              'dpi':'191',
-                              'update_version_code':'2023303040',
-                              '_rticket':_rticket,
-                              'is_pad':'0',
-                              'current_region':current_region,
-                              'app_type':'normal',
-                              'sys_region':region,
-                              'mcc_mnc':'21890',
-                              'timezone_name':tz_name,
-                              'residence':current_region,
-                              'app_language':webcast_language,
-                              'carrier_region':current_region,
-                              'ac2':'wifi',
-                              'uoo':'0',
-                              'op_region':current_region,
-                              'timezone_offset':off,
-                              'build_number':'33.3.4',
-                              'host_abi':'arm64-v8a',
-                              'locale':webcast_language,
-                              'region':region,
-                              'ts':ts,
-                              'cdid':uid})
-                              
-                         else:
-                              pro=urlencode({
-                              'enter_from':'homepage_hot',
-                              'owner_id':id,
-                              'report_type':'video',
-                              'object_id':aweme_id,
-                              'uri':'',
-                              'no_hw':'1',
-                              'current_video_play_time':'12',
-                              'isFirst':'1',
-                              'extra_log_params':'%7B%22last_from_group_id%22%3A%22'+aweme_id+'%22%2C%22is_ecom%22%3A%220%22%7D',
-                              'report_desc':'',
-                              'category':'',
-                              'iid':install_id,
-                              'device_id':device_id,
-                              'ac':'wifi',
-                              'channel':'googleplay',
-                              'aid':'1233',
-                              'app_name':'musical_ly',
-                              'version_code':'330304',
-                              'version_name':'33.3.4',
-                              'device_platform':'android',
-                              'os':'android',
-                              'ab_version':'33.3.4',
-                              'ssmix':'a',
-                              'device_type':type1,
-                              'device_brand':brand,
-                              'language':webcast_language,
-                              'os_api':'28',
-                              'os_version':'9',
-                              'openudid':openudid,
-                              'manifest_version_code':'2023303040',
-                              'resolution':f'{screen_width}*{screen_height}',
-                              'dpi':'191',
-                              'update_version_code':'2023303040',
-                              '_rticket':_rticket,
-                              'is_pad':'0',
-                              'current_region':current_region,
-                              'app_type':'normal',
-                              'sys_region':region,
-                              'mcc_mnc':'21890',
-                              'timezone_name':tz_name,
-                              'residence':current_region,
-                              'app_language':webcast_language,
-                              'carrier_region':current_region,
-                              'ac2':'wifi',
-                              'uoo':'0',
-                              'op_region':current_region,
-                              'timezone_offset':off,
-                              'build_number':'33.3.4',
-                              'host_abi':'arm64-v8a',
-                              'locale':webcast_language,
-                              'region':region,
-                              'ts':ts,
-                              'cdid':uid})
-                         u='https://api22-normal-c-useast1a.tiktokv.com/aweme/v2/aweme/feedback/?'
-                         url = u+pro
-                         payload = f''
-                         signed = ttsign(url.split('?')[1], payload, None).get_value()
-                         x_gorgon=signed['x-gorgon']
-                         x_khronos=signed['x-khronos']
-                         xss=signed['x-ss-req-ticket']
-                         
-                         h={
-                         'Cookie':
-                         f'sid_tt={sessionid}; sessionid={sessionid}; sessionid_ss={sessionid};',
-                        
-                         'User-Agent' :f'com.zhiliaoapp.musically/2023306030 (Linux; U; Android 12; {region}; {type1}; Build/NRD90M.{dev}KSU1AQDC;tt-ok/3.12.13.4-tiktok)',#SM-G955N
-     
-                         'X-Gorgon':x_gorgon,
-                         'X-Khronos':x_khronos,
-                         'X-SS-REQ-TICKET':xss,
-                    }
-                    try:
-                         r=requests.get(url,headers=h,proxies={'https': f'socks5://{str(random.choice(ls))}','https': f'socks4://{str(random.choice(ls))}','https': f'http://{str(random.choice(ls))}'}).text
-                         tr+=1
-                         if aweme_id in soso:
-                              pass
-                         else:
-                              soso.append(aweme_id)
-                         if sessionid in loop:
-                              pass
-                         else:
-                              loop.append(sessionid)
-                         bi = random.choice([F,J,Z,C,B,L,J1,J2,J21,J22,F1,C1,P1])
-                         print(bi+f"\r {len(soso)}/{len(tar)} True :{F}[{tr}] {bi}Net :{Z}[{fa}]{bi} {len(loop)}/{len(sisn)}",end=" ");sys.stdout.flush()
-                    except:
-                         fa +=1
-                         bi = random.choice([F,J,Z,C,B,L,J1,J2,J21,J22,F1,C1,P1])
-                         print(bi+f"\r {len(soso)}/{len(tar)} True :{F}[{tr}] {bi}Net :{Z}[{fa}]{bi} {len(loop)}/{len(sisn)}",end=" ");sys.stdout.flush()
-          
+BAR      = "──────────────────────────────────────────────────────────────────────────────"
+WIDE_BAR = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-# -*- coding: utf-8 -*-
-# NASR — TikTok AR • Per-Session Report Selection • Lists fixed & cleaned
+session = requests.Session()
+soso, loop, tar, x_, ls, sisn = [], [], [], [], [], []
 
-# -*- coding: utf-8 -*-
-# NASR — TikTok AR • Per-Session, No-Miss ID Processing with Retries
+def clear_screen():
+    os.system('cls' if os.name == 'nt' else 'clear')
 
-import os, re, time, sys, threading, gc, random
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from queue import Queue, Empty
+def print_tiktok_logo():
+    logo_red = [
+        "           ████        ",
+        "         ████████      ",
+        "        ███    ███     ",
+        "        ███            ",
+        "        ███   ██████   ",
+        "         ███████  ███  ",
+        "              ███ ███  ",
+    ]
+    logo_cyan = [
+        "            ████       ",
+        "          ████████     ",
+        "         ███    ███    ",
+        "         ███           ",
+        "         ███   ██████  ",
+        "          ███████  ███ ",
+        "               ███ ███ ",
+    ]
+    for ln in logo_red:  print(ACCENT2 + " " + ln + Style.RESET_ALL)
+    for ln in logo_cyan: print(ACCENT1 + ln + Style.RESET_ALL)
+    print(TITLE + "[ NASR // TikTok Reports ]" + Style.RESET_ALL)
+    print(TEXT + BAR + Style.RESET_ALL)
+
+def print_lists_only():
+    print(TITLE + "[ فئة البلاغات الحساسة والقانونية (1 → 33) ]" + Style.RESET_ALL)
+    group_a = [
+        (1,  "المحتوى عبارة عن مادة اعتداء جنسي على الأطفال"),
+        (2,  "عرض توريد مواد الاعتداء الجنسي على الأطفال وبيعها وتوزيعها"),
+        (3,  "المحتوى المتعلق باستمالة طفل أو إغواءه جنسيًا"),
+        (4,  "التهديد بالعنف/التحريض على ارتكاب جريمة (جرائم) إرهابية"),
+        (5,  "المحتوى المتعلق بالتجنيد والتمويل ودعم الإرهاب"),
+        (6,  "تعليمات أو تدريب حول كيفية صنع المتفجرات/الأسلحة/الأسلحة النارية (لأغراض إرهابية)"),
+        (7,  "خطاب الكراهية غير القانوني"),
+        (8,  "تصوير العنف بشع المنظر"),
+        (9,  "المشاركة في منظمة إجرامية"),
+        (10, "انتهاكات الخصوصية القائمة على الصور"),
+        (11, "انتحال الهوية بشكل غير قانوني"),
+        (12, "انتهاكات أخرى للخصوصية"),
+        (13, "مشاركة الصور الحميمة أو الخاصة دون موافقة"),
+        (14, "المحتوى المرتبط بالاتجار بالبشر (الإعلانات، والمزيد)"),
+        (15, "الترويج للدعارة/الاستدراج"),
+        (16, "إنتاج العقاقير/المخدرات غير المشروعة أو بيعها أو توريدها أو توزيعه"),
+        (17, "المحتوى الذي يروّج للصيد الجائر أو الاتجار غير المشروع بالأحياء البرية"),
+        (18, "الاتجار غير المشروع بالأسلحة"),
+        (19, "السلع غير القانونية الأخرى"),
+        (20, "المضايقات أو التهديدات"),
+        (21, "التشهير"),
+        (22, "خرق قانون المستهلك"),
+        (23, "المنتجات/البضائع غير الآمنة أو الخطر"),
+        (24, "التضليل الجنائي"),
+        (25, "ازدراء المحكمة أو خرق أمر المحكمة أو التصريح غير القانوني"),
+        (26, "إعطاء تعليمات/تشجيع يتعلق بالانتحار"),
+        (27, "الاحتيال"),
+        (28, "غسيل الأموال"),
+        (29, "الابتزاز/الرشوة"),
+        (30, "الجرائم المتعلقة بالأمن القومي (الخيانة والتجسس والتخريب وتعريض الأمن الداخلي أو الخارجي للخطر"),
+        (31, "محتوى غير قانوني آخر"),
+        (32, "عشوائي قانون الأوربي"),
+        (33, "بلاغ النسر"),
+    ]
+    for n, label in group_a:
+        print(ACCENT1 + f"  {n:>2} | " + TEXT + label)
+
+    print(TEXT + BAR + Style.RESET_ALL)
+    print(TITLE + "[ فئة البلاغات العامة والمساعدة (34 → 63) ]" + Style.RESET_ALL)
+    group_b = [
+        (34, "بلاغ: الكلام الذي يحض على الكراهية والسلوكيات البغيضة"),
+        (35, "بلاغ: لقد تعرضت بنفسي للتنمر أو المضايقة"),
+        (36, "تعرض شخص أعرفه للتنمر أو المضايقة "),
+        (37, "تعرض أحد المشاهير أو المسؤولين الحكوميين للتنمر أو المضايقة "),
+        (38, "تعرض آخرون للتنمر أو المضايقة "),
+        (39, "الانتحار وإيذاء النفس"),
+        (40, "اضطرابات الأكل وصورة الجسم غير الصحية"),
+        (41, "الأنشطة والتحديات الخطرة"),
+        (42, "النشاط الجنسي للشباب والاستدراج الجنسي والاستغلال الجنسي"),
+        (43, "السلوك الموحي جنسيًا بواسطة الشباب"),
+        (44, "النشاط الجنسي للبالغين والخدمات الجنسية والاستدراج الجنسي"),
+        (45, "عُري البالغين"),
+        (46, "اللغة الجنسية الفاحشة"),
+        (47, "المحتوى صادم وبشع المنظر"),
+        (48, "معلومات خاطئة عن الانتخابات "),
+        (49, "معلومات ضارة مضللة "),
+        (50, "التزييف العميق والوسائط التركيبية والوسائط التي تم التلاعب بها"),
+        (51, "التفاعل الزائف"),
+        (52, "مزعج"),
+        (53, "المقامرة"),
+        (54, "الكحول والتبغ والمخدرات"),
+        (55, "الأسلحة النارية والأسلحة الخطرة"),
+        (56, "تجارة السلع والخدمات الأخرى الخاضعة للإرشادات التنظيمية "),
+        (57, "الغش والاحتيال"),
+        (58, "مشاركة المعلومات الشخصية "),
+        (59, "اشتباه في انتهاك الملكية الفكرية لآخرين"),
+        (60, "محتوى مرتبط بعلامة تجارية غير معلن عنه "),
+        (61, "آخر"),
+        (62, "ثغرة رقم 1"),
+        (63, "عشوائي عربي"),
+    ]
+    for n, label in group_b:
+        print(ACCENT1 + f"  {n:>2} | " + TEXT + label)
+
+    print(TEXT + BAR + Style.RESET_ALL)
+
+file_path = "1.txt"
+if os.path.isfile(file_path):
+    with open(file_path, 'r', encoding="utf-8") as f:
+        sisn = [line.strip() for line in f if line.strip()]
+else:
+    sisn = []
+
+GREEN = "\033[92m"
+RED = "\033[91m"
+TURQUOISE = "\033[38;5;45m"
+RESET = "\033[0m"
+
+q1 = sorted(['950111'])
+q2 = sorted(['950112'])
+q3 = sorted(['950113'])
+q4 = sorted(['950121'])
+q5 = sorted(['950122'])
+q6 = sorted(['950123'])
+q7 = sorted(['95013'])
+q8 = sorted(['950141'])
+q9 = sorted(['950142'])
+q10 = sorted(['950151'])
+q11 = sorted(['950152'])
+q12 = sorted(['950153'])
+q13 = sorted(['95016'])
+q14 = sorted(['950171'])
+q15 = sorted(['950172'])
+q16 = sorted(['950173'])
+q17 = sorted(['950174'])
+q18 = sorted(['950175'])
+q19 = sorted(['950176'])
+q20 = sorted(['95018'])
+q21 = sorted(['95019'])
+q22 = sorted(['950201'])
+q23 = sorted(['950202'])
+q24 = sorted(['950211'])
+q25 = sorted(['950212'])
+q26 = sorted(['950213'])
+q27 = sorted(['950221'])
+q28 = sorted(['950222'])
+q29 = sorted(['950223'])
+q30 = sorted(['950231'])
+q31 = sorted(['95024'])
+q32 = sorted([
+    '950111','950112','950113','950121','950122','950123','95013','950141','950142','950151','950152','950153','95016','950171','950172','950173','950174','950175','95018','95019','950201','950202','950211','950212','950213','950221','950222','950223','950231','95024',
+])
+q33 = sorted([
+    '90012','90013','90014','90015','90016','90017','9002','9007','90061','90063','90064','90084','90085','90086','90087','90088','9005','90111','90115','90116','90191','9010','90114','90034','90037','90032','90038','9004','9018','902112','9013',
+    '950111','950112','950113','950121','950122','950123','95013','950141','950142','950151','950152','950153','95016','950171','950172','950173','950174','950175','95018','95019','950201','950202','950211','950212','950213','950221','950222','950223','950231','95024',
+    '90012','90013','90014','90015','90016','90017','9002','9007','90061','90063','90064','90084','90085','90086','90087','90088','9005','90111','90115','90116','90191','9010','90114','90034','90037','90032','90038','9004','9018','902112','9013',
+])
+q34 = sorted(['9002'])
+q35 = sorted(['90071'])
+q36 = sorted(['90072'])
+q37 = sorted(['90073'])
+q38 = sorted(['90074'])
+q39 = sorted(['90061'])
+q40 = sorted(['90063'])
+q41 = sorted(['90064'])
+q42 = sorted(['90084'])
+q43 = sorted(['90085'])
+q44 = sorted(['90086'])
+q45 = sorted(['90087'])
+q46 = sorted(['90088'])
+q47 = sorted(['9005'])
+q48 = sorted(['90111'])
+q49 = sorted(['90115'])
+q50 = sorted(['90116'])
+q51 = sorted(['90191'])
+q52 = sorted(['9010'])
+q53 = sorted(['90034'])
+q54 = sorted(['90037'])
+q55 = sorted(['90032'])
+q56 = sorted(['90038'])
+q57 = sorted(['9004'])
+q58 = sorted(['9018'])
+q59 = sorted(['902112'])
+q60 = sorted(['90114'])
+q61 = sorted(['9013'])
+q62 = sorted([
+    '9002','950111','950112','950113','950121','950122','950123','95013','950141','950142','950151','950152','950153','95016','950171','950172','950173','950174','950175','95018','95019','950201','950202','950211','950212','950213','950221','950222','950223','950231','95024','90071','950111','950112','950113','950121','950122','950123','95013','950141','950142','950151','950152','950153','95016','950171','950172','950173','950174','950175','95018','95019','950201','950202','950211','950212','950213','950221','950222','950223','950231','95024','90074','950111','950112','950113','950121','950122','950123','95013','950141','950142','950151','950152','950153','95016','950171','950172','950173','950174','950175','95018','95019','950201','950202','950211','950212','950213','950221','950222','950223','950231','95024','90088','950111','950112','950113','950121','950122','950123','95013','950141','950142','950151','950152','950153','95016','950171','950172','950173','950174','950175','95018','95019','950201','950202','950211','950212','950213','950221','950222','950223','950231','95024','9013','950111','950112','950113','950121','950122','950123','95013','950141','950142','950151','950152','950153','95016','950171','950172','950173','950174','950175','95018','95019','950201','950202','950211','950212','950213','950221','950222','950223','950231','95024',
+])
+q63 = sorted([
+    '90012','90013','90014','90015','90016','90017','9002','9007','90061','90063','90064','90084','90085','90086','90087','90088','9005','90111','90115','90116','90191','9010','90114','90034','90037','90032','90038','9004','9018','902112','9013',
+])
+
+clear_screen()
+print_tiktok_logo()
+if sisn:
+    print(TEXT + f"تم تحميل {len(sisn)} سيشن من 1.txt" + Style.RESET_ALL)
+else:
+    print(TEXT + "الملف 1.txt غير موجود أو فارغ" + Style.RESET_ALL)
+print(TEXT + BAR + Style.RESET_ALL)
+
+print_lists_only()
+choice = input(ACCENT1 + "أدخل رقم الاختيار: " + Style.RESET_ALL).strip()
+
+if choice == '1':
+    sdsd = q1
+    print(TURQUOISE + "تم اختيار: المحتوى عبارة عن مادة اعتداء جنسي على الأطفال" + RESET)
+elif choice == '2':
+    sdsd = q2
+    print(TURQUOISE + "تم اختيار: عرض توريد مواد الاعتداء الجنسي على الأطفال وبيعها وتوزيعها" + RESET)
+elif choice == '3':
+    sdsd = q3
+    print(TURQUOISE + "تم اختيار: المحتوى المتعلق باستمالة طفل أو إغواءه جنسيًا" + RESET)
+elif choice == '4':
+    sdsd = q4
+    print(TURQUOISE + "تم اختيار: التهديد بالعنف/التحريض على ارتكاب جريمة (جرائم) إرهابية" + RESET)
+elif choice == '5':
+    sdsd = q5
+    print(TURQUOISE + "تم اختيار: المحتوى المتعلق بالتجنيد والتمويل ودعم الإرهاب" + RESET)
+elif choice == '6':
+    sdsd = q6
+    print(TURQUOISE + "تم اختيار: تعليمات أو تدريب حول كيفية صنع المتفجرات/الأسلحة/الأسلحة النارية (لأغراض إرهابية)" + RESET)
+elif choice == '7':
+    sdsd = q7
+    print(TURQUOISE + "تم اختيار: خطاب الكراهية غير القانوني" + RESET)
+elif choice == '8':
+    sdsd = q8
+    print(TURQUOISE + "تم اختيار: تصوير العنف بشع المنظر" + RESET)
+elif choice == '9':
+    sdsd = q9
+    print(TURQUOISE + "تم اختيار: المشاركة في منظمة إجرامية" + RESET)
+elif choice == '10':
+    sdsd = q10
+    print(TURQUOISE + "تم اختيار: انتهاكات الخصوصية القائمة على الصور" + RESET)
+elif choice == '11':
+    sdsd = q11
+    print(TURQUOISE + "تم اختيار: انتحال الهوية بشكل غير قانوني" + RESET)
+elif choice == '12':
+    sdsd = q12
+    print(TURQUOISE + "تم اختيار: انتهاكات أخرى للخصوصية" + RESET)
+elif choice == '13':
+    sdsd = q13
+    print(TURQUOISE + "تم اختيار: مشاركة الصور الحميمة أو الخاصة دون موافقة" + RESET)
+elif choice == '14':
+    sdsd = q14
+    print(TURQUOISE + "تم اختيار: المحتوى المرتبط بالاتجار بالبشر (الإعلانات، والمزيد)" + RESET)
+elif choice == '15':
+    sdsd = q15
+    print(TURQUOISE + "تم اختيار: الترويج للدعارة/الاستدراج" + RESET)
+elif choice == '16':
+    sdsd = q16
+    print(TURQUOISE + "تم اختيار: إنتاج العقاقير/المخدرات غير المشروعة أو بيعها أو توريدها أو توزيعه" + RESET)
+elif choice == '17':
+    sdsd = q17
+    print(TURQUOISE + "تم اختيار: المحتوى الذي يروّج للصيد الجائر أو الاتجار غير المشروع بالأحياء البرية" + RESET)
+elif choice == '18':
+    sdsd = q18
+    print(TURQUOISE + "تم اختيار: الاتجار غير المشروع بالأسلحة" + RESET)
+elif choice == '19':
+    sdsd = q19
+    print(TURQUOISE + "تم اختيار: السلع غير القانونية الأخرى" + RESET)
+elif choice == '20':
+    sdsd = q20
+    print(TURQUOISE + "تم اختيار: المضايقات أو التهديدات" + RESET)
+elif choice == '21':
+    sdsd = q21
+    print(TURQUOISE + "تم اختيار: التشهير" + RESET)
+elif choice == '22':
+    sdsd = q22
+    print(TURQUOISE + "تم اختيار: خرق قانون المستهلك" + RESET)
+elif choice == '23':
+    sdsd = q23
+    print(TURQUOISE + "تم اختيار: المنتجات/البضائع غير الآمنة أو الخطر" + RESET)
+elif choice == '24':
+    sdsd = q24
+    print(TURQUOISE + "تم اختيار: التضليل الجنائي" + RESET)
+elif choice == '25':
+    sdsd = q25
+    print(TURQUOISE + "تم اختيار: ازدراء المحكمة أو خرق أمر المحكمة أو التصريح غير القانوني" + RESET)
+elif choice == '26':
+    sdsd = q26
+    print(TURQUOISE + "تم اختيار: إعطاء تعليمات/تشجيع يتعلق بالانتحار" + RESET)
+elif choice == '27':
+    sdsd = q27
+    print(TURQUOISE + "تم اختيار: الاحتيال" + RESET)
+elif choice == '28':
+    sdsd = q28
+    print(TURQUOISE + "تم اختيار: غسيل الأموال" + RESET)
+elif choice == '29':
+    sdsd = q29
+    print(TURQUOISE + "تم اختيار: الابتزاز/الرشوة" + RESET)
+elif choice == '30':
+    sdsd = q30
+    print(TURQUOISE + "تم اختيار: الجرائم المتعلقة بالأمن القومي (الخيانة والتجسس والتخريب وتعريض الأمن الداخلي أو الخارجي للخطر" + RESET)
+elif choice == '31':
+    sdsd = q31
+    print(TURQUOISE + "تم اختيار: محتوى غير قانوني آخر" + RESET)
+elif choice == '32':
+    sdsd = q32
+    print(TURQUOISE + "تم اختيار: عشوائي قانون الأوربي" + RESET)
+elif choice == '33':
+    sdsd = q33
+    print(TURQUOISE + "تم اختيار: بلاغ النسر" + RESET)
+elif choice == '34':
+    sdsd = q34
+    print(GREEN + "تم اختيار: بلاغ الكراهية والسلوكيات البغيضة" + RESET)
+elif choice == '35':
+    sdsd = q35
+    print(GREEN + "تم اختيار: لقد تعرضت بنفسي للتنمر أو المضايقة" + RESET)
+elif choice == '36':
+    sdsd = q36
+    print(GREEN + "تم اختيار: تعرض شخص أعرفه للتنمر أو المضايقة" + RESET)
+elif choice == '37':
+    sdsd = q37
+    print(GREEN + "تم اختيار: تعرض أحد المشاهير أو المسؤولين الحكوميين للتنمر أو المضايقة" + RESET)
+elif choice == '38':
+    sdsd = q38
+    print(GREEN + "تم اختيار: تعرض آخرون للتنمر أو المضايقة" + RESET)
+elif choice == '39':
+    sdsd = q39
+    print(GREEN + "تم اختيار: الانتحار وإيذاء النفس" + RESET)
+elif choice == '40':
+    sdsd = q40
+    print(GREEN + "تم اختيار: اضطرابات الأكل وصورة الجسم غير الصحية" + RESET)
+elif choice == '41':
+    sdsd = q41
+    print(GREEN + "تم اختيار: الأنشطة والتحديات الخطرة" + RESET)
+elif choice == '42':
+    sdsd = q42
+    print(GREEN + "تم اختيار: النشاط الجنسي للشباب والاستدراج الجنسي والاستغلال الجنسي" + RESET)
+elif choice == '43':
+    sdsd = q43
+    print(GREEN + "تم اختيار: السلوك الموحي جنسيًا بواسطة الشباب" + RESET)
+elif choice == '44':
+    sdsd = q44
+    print(GREEN + "تم اختيار: النشاط الجنسي للبالغين والخدمات الجنسية والاستدراج الجنسي" + RESET)
+elif choice == '45':
+    sdsd = q45
+    print(GREEN + "تم اختيار: عُري البالغين" + RESET)
+elif choice == '46':
+    sdsd = q46
+    print(GREEN + "تم اختيار: اللغة الجنسية الفاحشة" + RESET)
+elif choice == '47':
+    sdsd = q47
+    print(GREEN + "تم اختيار: المحتوى صادم وبشع المنظر" + RESET)
+elif choice == '48':
+    sdsd = q48
+    print(GREEN + "تم اختيار: معلومات خاطئة عن الانتخابات" + RESET)
+elif choice == '49':
+    sdsd = q49
+    print(GREEN + "تم اختيار: معلومات ضارة مضللة" + RESET)
+elif choice == '50':
+    sdsd = q50
+    print(GREEN + "تم اختيار: التزييف العميق والوسائط التركيبية والوسائط التي تم التلاعب بها" + RESET)
+elif choice == '51':
+    sdsd = q51
+    print(GREEN + "تم اختيار: التفاعل الزائف" + RESET)
+elif choice == '52':
+    sdsd = q52
+    print(GREEN + "تم اختيار: مزعج" + RESET)
+elif choice == '53':
+    sdsd = q53
+    print(GREEN + "تم اختيار: المقامرة" + RESET)
+elif choice == '54':
+    sdsd = q54
+    print(GREEN + "تم اختيار: الكحول والتبغ والمخدرات" + RESET)
+elif choice == '55':
+    sdsd = q55
+    print(GREEN + "تم اختيار: الأسلحة النارية والأسلحة الخطرة" + RESET)
+elif choice == '56':
+    sdsd = q56
+    print(GREEN + "تم اختيار: تجارة السلع والخدمات الأخرى الخاضعة للإرشادات التنظيمية" + RESET)
+elif choice == '57':
+    sdsd = q57
+    print(GREEN + "تم اختيار: الغش والاحتيال" + RESET)
+elif choice == '58':
+    sdsd = q58
+    print(GREEN + "تم اختيار: مشاركة المعلومات الشخصية" + RESET)
+elif choice == '59':
+    sdsd = q59
+    print(GREEN + "تم اختيار: اشتباه في انتهاك الملكية الفكرية لآخرين" + RESET)
+elif choice == '60':
+    sdsd = q60
+    print(GREEN + "تم اختيار: محتوى مرتبط بعلامة تجارية غير معلن عنه" + RESET)
+elif choice == '61':
+    sdsd = q61
+    print(GREEN + "تم اختيار: آخر" + RESET)
+elif choice == '62':
+    sdsd = q62
+    print(GREEN + "تم اختيار: ثغرة رقم 1" + RESET)
+elif choice == '63':
+    sdsd = q63
+    print(GREEN + "تم اختيار: عشوائي عربي" + RESET)
+else:
+    print(RED + "اختيار غير صحيح، تم استخدام بلاغ أوروبي كخيار افتراضي" + RESET)
+    sdsd = q32  # افتراضي أوروبي
+
+print(TEXT + WIDE_BAR + Style.RESET_ALL)
+print(TEXT + "تم تجهيز قائمة الرموز المختارة (sdsd). يمكنك متابعة المعالجة الأساسية الآن." + Style.RESET_ALL)
+tr,fa,er=0,0,0
+class ttsign:
+    def __init__(self, params: str, data: str, cookies: str) -> None:
+        self.params = params
+        self.data = data
+        self.cookies = cookies
+    def hash(self, data: str) -> str:
+        return str(hashlib.md5(data.encode()).hexdigest())
+    def get_base_string(self) -> str:
+        base_str = self.hash(self.params)
+        base_str = (
+            base_str + self.hash(self.data) if self.data else base_str + str("0" * 32)
+        )
+        base_str = (
+            base_str + self.hash(self.cookies)
+            if self.cookies
+            else base_str + str("0" * 32)
+        )
+        return base_str
+    def get_value(self) -> json:
+        return self.encrypt(self.get_base_string())
+    def encrypt(self, data: str) -> json:
+        unix = time.time()
+        len = 0x14
+        key = [
+
+            0xDF,
+            0x77,
+            0xB9,
+            0x40,
+            0xB9,
+            0x9B,
+            0x84,
+            0x83,
+            0xD1,
+            0xB9,
+            0xCB,
+            0xD1,
+            0xF7,
+            0xC2,
+            0xB9,
+            0x85,
+            0xC3,
+            0xD0,
+            0xFB,
+            0xC3,
+        ]
+        param_list = []
+        for i in range(0, 12, 4):
+            temp = data[8 * i : 8 * (i + 1)]
+            for j in range(4):
+                H = int(temp[j * 2 : (j + 1) * 2], 16)
+                param_list.append(H)
+        param_list.extend([0x0, 0x6, 0xB, 0x1C])
+        H = int(hex(int(unix)), 16)
+        param_list.append((H & 0xFF000000) >> 24)
+        param_list.append((H & 0x00FF0000) >> 16)
+        param_list.append((H & 0x0000FF00) >> 8)
+        param_list.append((H & 0x000000FF) >> 0)
+        eor_result_list = []
+        for A, B in zip(param_list, key):
+            eor_result_list.append(A ^ B)
+        for i in range(len):
+            C = self.reverse(eor_result_list[i])
+            D = eor_result_list[(i + 1) % len]
+            E = C ^ D
+            F = self.rbit_algorithm(E)
+            H = ((F ^ 0xFFFFFFFF) ^ len) & 0xFF
+            eor_result_list[i] = H
+        result = ""
+        for param in eor_result_list:
+            result += self.hex_string(param)
+        return {
+            "x-ss-req-ticket": str(int(unix * 1000)),
+            "x-khronos": str(int(unix)),
+            "x-gorgon": ("0404b0d30000" + result),
+        }
+
+    def rbit_algorithm(self, num):
+        result = ""
+        tmp_string = bin(num)[2:]
+        while len(tmp_string) < 8:
+            tmp_string = "0" + tmp_string
+        for i in range(0, 8):
+            result = result + tmp_string[7 - i]
+        return int(result, 2)
+
+    def hex_string(self, num):
+        tmp_string = hex(num)[2:]
+        if len(tmp_string) < 2:
+            tmp_string = "0" + tmp_string
+        return tmp_string
+
+    def reverse(self, num):
+        tmp_string = self.hex_string(num)
+        return int(tmp_string[1:] + tmp_string[:1], 16)
+P = '\x1b[1;97m'
+B = '\x1b[1;94m'
+O = '\x1b[1;96m'
+Z = "\033[1;30m"
+X = '\033[1;33m' #اصفر
+F = '\033[2;32m'
+Z = '\033[1;31m' 
+L = "\033[1;95m"  #ارجواني
+C = '\033[2;35m' #وردي
+A = '\033[2;39m' #ازرق
+P = "\x1b[38;5;231m" # Putih
+J = "\x1b[38;5;208m" # Jingga
+J1='\x1b[38;5;202m'
+J2='\x1b[38;5;203m' #وردي
+J21='\x1b[38;5;204m'
+J22='\x1b[38;5;209m'
+F1='\x1b[38;5;76m'
+C1='\x1b[38;5;120m'
+P1='\x1b[38;5;150m'
+P2='\x1b[38;5;190m'
+def clear():
+            import os
+from termcolor import colored
+
+def clear():
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+print(colored("[3]  أبدء البلاغ", "cyan"))
+
+Get_aobsh = "3"
+print(colored(f"تم اختيار رقم {Get_aobsh} تلقائياً ✅", "green"))
+
+clear()
